@@ -2,7 +2,7 @@ use anyhow::Result;
 use collections::BTreeMap;
 use credentials_provider::CredentialsProvider;
 use futures::{FutureExt, StreamExt, future::BoxFuture};
-use gpui::{AnyView, App, AsyncApp, Context, Entity, SharedString, Task, TaskExt, Window};
+use gpui::{AnyView, App, AsyncApp, ClickEvent, Context, Entity, SharedString, Task, Window};
 use http_client::{AsyncBody, HttpClient, Method, Request as HttpRequest};
 use language_model::{
     ApiKeyState, AuthenticateError, EnvVar, IconOrSvg, LanguageModel, LanguageModelCompletionError,
@@ -14,8 +14,9 @@ use language_model::{
 use menu;
 use open_ai::{ResponseStreamEvent, stream_completion};
 use settings::{Settings, SettingsStore};
+use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
-use ui::{ButtonLink, ConfiguredApiCard, List, ListBulletItem, prelude::*};
+use ui::prelude::*;
 use ui_input::InputField;
 use util::ResultExt;
 
@@ -29,6 +30,18 @@ const PROVIDER_NAME: LanguageModelProviderName = LanguageModelProviderName::new(
 const DEFAULT_API_URL: &str = "http://localhost:3003/v1";
 const AUTH_TOKEN_ENV_VAR_NAME: &str = "WINDSURF_AUTH_TOKEN";
 static AUTH_TOKEN_ENV_VAR: LazyLock<EnvVar> = env_var!(AUTH_TOKEN_ENV_VAR_NAME);
+
+#[derive(Clone, Debug, Default)]
+struct ProxyAccount {
+    id: String,
+    email: String,
+    tier: String,
+    status: String,
+    daily_percent: Option<u32>,
+    weekly_percent: Option<u32>,
+    plan_name: Option<String>,
+    last_used: Option<String>,
+}
 
 #[derive(Default, Clone, Debug, PartialEq)]
 pub struct WindsurfSettings {
@@ -47,11 +60,17 @@ pub struct State {
     api_key_state: ApiKeyState,
     credentials_provider: Arc<dyn CredentialsProvider>,
     http_client: Arc<dyn HttpClient>,
+    proxy_accounts: Vec<ProxyAccount>,
+    accounts_loading: bool,
+    add_account_error: Option<String>,
+    selected_account_ids: HashSet<String>,
 }
 
 impl State {
     fn is_authenticated(&self) -> bool {
-        self.auto_authenticated || self.api_key_state.has_key()
+        self.auto_authenticated
+            || self.api_key_state.has_key()
+            || !self.proxy_accounts.is_empty()
     }
 
     fn set_api_key(&mut self, token: Option<String>, cx: &mut Context<Self>) -> Task<Result<()>> {
@@ -82,25 +101,44 @@ impl State {
         let credentials_provider = self.credentials_provider.clone();
         let api_url = WindsurfLanguageModelProvider::api_url(cx);
         let http_client = self.http_client.clone();
-        let load_task = self.api_key_state.load_if_needed(
-            api_url.clone(),
-            |this| &mut this.api_key_state,
-            credentials_provider,
-            cx,
-        );
         cx.spawn(async move |this, cx| {
-            load_task.await?;
-            // Try auto-registration from local Windsurf installation first
-            let auto_ok = auto_register_windsurf_tokens(http_client.as_ref(), &api_url).await;
-            if auto_ok {
-                this.update(cx, |this, cx| {
-                    this.auto_authenticated = true;
-                    cx.notify();
-                })
-                .log_err();
-            } else {
-                // Fall back to manually stored credential
-                if let Ok(Some(token)) = this.read_with(cx, |this, _| this.api_key_state.key(&api_url)) {
+            // Check proxy accounts FIRST — if any exist, never touch the macOS keychain.
+            // This prevents the "zed wants to access keychain" dialog on every startup.
+            let existing = fetch_proxy_accounts(http_client.as_ref(), &api_url)
+                .await
+                .unwrap_or_default();
+            let has_existing = !existing.is_empty();
+            this.update(cx, |this, cx| {
+                this.proxy_accounts = existing;
+                cx.notify();
+            })
+            .log_err();
+
+            if !has_existing {
+                // No proxy accounts — fall back to keychain / env var / auto-register
+                let load_task = this
+                    .update(cx, |this, cx| {
+                        this.api_key_state.load_if_needed(
+                            api_url.clone(),
+                            |s| &mut s.api_key_state,
+                            credentials_provider,
+                            cx,
+                        )
+                    })
+                    .map_err(|_| AuthenticateError::CredentialsNotFound)?;
+                load_task.await?;
+
+                let auto_ok =
+                    auto_register_windsurf_tokens(http_client.as_ref(), &api_url).await;
+                if auto_ok {
+                    this.update(cx, |this, cx| {
+                        this.auto_authenticated = true;
+                        cx.notify();
+                    })
+                    .log_err();
+                } else if let Ok(Some(token)) =
+                    this.read_with(cx, |this, _| this.api_key_state.key(&api_url))
+                {
                     register_api_key_with_proxy(http_client.as_ref(), &api_url, &token)
                         .await
                         .log_err();
@@ -114,7 +152,155 @@ impl State {
                 })
                 .log_err();
             }
+            // Fetch proxy account list (again after auth to get fresh credits)
+            let accounts = fetch_proxy_accounts(http_client.as_ref(), &api_url).await;
+            this.update(cx, |this, cx| {
+                this.proxy_accounts = accounts.unwrap_or_default();
+                cx.notify();
+            })
+            .log_err();
+
+            // Start periodic background refresh every 5 minutes
+            cx.spawn({
+                let this = this.clone();
+                async move |cx| {
+                    loop {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_secs(300))
+                            .await;
+                        let Ok(task) =
+                            this.update(cx, |state, cx| state.refresh_accounts(cx))
+                        else {
+                            break;
+                        };
+                        task.await;
+                    }
+                }
+            })
+            .detach();
+
             Ok(())
+        })
+    }
+
+    fn refresh_accounts(&mut self, cx: &mut Context<Self>) -> Task<()> {
+        let http_client = self.http_client.clone();
+        let api_url = WindsurfLanguageModelProvider::api_url(cx);
+        self.accounts_loading = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let accounts = fetch_proxy_accounts(http_client.as_ref(), &api_url).await;
+            this.update(cx, |this, cx| {
+                this.proxy_accounts = accounts.unwrap_or_default();
+                this.accounts_loading = false;
+                cx.notify();
+            })
+            .log_err();
+        })
+    }
+
+    fn add_email_account(
+        &mut self,
+        email: String,
+        password: String,
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        let http_client = self.http_client.clone();
+        let api_url = WindsurfLanguageModelProvider::api_url(cx);
+        self.add_account_error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            match add_email_account_to_proxy(http_client.as_ref(), &api_url, &email, &password)
+                .await
+            {
+                Ok(_) => {
+                    let accounts = fetch_proxy_accounts(http_client.as_ref(), &api_url)
+                        .await
+                        .unwrap_or_default();
+                    this.update(cx, |this, cx| {
+                        this.proxy_accounts = accounts;
+                        this.auto_authenticated = !this.proxy_accounts.is_empty();
+                        this.add_account_error = None;
+                        cx.notify();
+                    })
+                    .log_err();
+                }
+                Err(e) => {
+                    this.update(cx, |this, cx| {
+                        this.add_account_error = Some(e.to_string());
+                        cx.notify();
+                    })
+                    .log_err();
+                }
+            }
+        })
+    }
+
+    fn remove_account(&mut self, account_id: String, cx: &mut Context<Self>) -> Task<()> {
+        let http_client = self.http_client.clone();
+        let api_url = WindsurfLanguageModelProvider::api_url(cx);
+        cx.spawn(async move |this, cx| {
+            if remove_proxy_account(http_client.as_ref(), &api_url, &account_id)
+                .await
+                .is_ok()
+            {
+                let accounts = fetch_proxy_accounts(http_client.as_ref(), &api_url)
+                    .await
+                    .unwrap_or_default();
+                this.update(cx, |this, cx| {
+                    this.proxy_accounts = accounts;
+                    this.selected_account_ids.remove(&account_id);
+                    if this.proxy_accounts.is_empty() {
+                        this.auto_authenticated = false;
+                    }
+                    cx.notify();
+                })
+                .log_err();
+            }
+        })
+    }
+
+    fn toggle_selection(&mut self, account_id: String, cx: &mut Context<Self>) {
+        if self.selected_account_ids.contains(&account_id) {
+            self.selected_account_ids.remove(&account_id);
+        } else {
+            self.selected_account_ids.insert(account_id);
+        }
+        cx.notify();
+    }
+
+    fn select_all_accounts(&mut self, cx: &mut Context<Self>) {
+        self.selected_account_ids = self.proxy_accounts.iter().map(|a| a.id.clone()).collect();
+        cx.notify();
+    }
+
+    fn deselect_all_accounts(&mut self, cx: &mut Context<Self>) {
+        self.selected_account_ids.clear();
+        cx.notify();
+    }
+
+    fn remove_selected_accounts(&mut self, cx: &mut Context<Self>) -> Task<()> {
+        let ids: Vec<String> = self.selected_account_ids.iter().cloned().collect();
+        let http_client = self.http_client.clone();
+        let api_url = WindsurfLanguageModelProvider::api_url(cx);
+        self.selected_account_ids.clear();
+        cx.spawn(async move |this, cx| {
+            for id in &ids {
+                remove_proxy_account(http_client.as_ref(), &api_url, id)
+                    .await
+                    .log_err();
+            }
+            let accounts = fetch_proxy_accounts(http_client.as_ref(), &api_url)
+                .await
+                .unwrap_or_default();
+            this.update(cx, |this, cx| {
+                this.proxy_accounts = accounts;
+                if this.proxy_accounts.is_empty() {
+                    this.auto_authenticated = false;
+                }
+                cx.notify();
+            })
+            .log_err();
         })
     }
 }
@@ -144,6 +330,10 @@ impl WindsurfLanguageModelProvider {
                 api_key_state: ApiKeyState::new(Self::api_url(cx), (*AUTH_TOKEN_ENV_VAR).clone()),
                 credentials_provider,
                 http_client: http_client.clone(),
+                proxy_accounts: Vec::new(),
+                accounts_loading: false,
+                add_account_error: None,
+                selected_account_ids: HashSet::new(),
             }
         });
 
@@ -472,20 +662,17 @@ impl LanguageModel for WindsurfLanguageModel {
 }
 
 struct ConfigurationView {
-    api_key_editor: Entity<InputField>,
+    email_editor: Entity<InputField>,
+    password_editor: Entity<InputField>,
     state: Entity<State>,
     load_credentials_task: Option<Task<()>>,
 }
 
 impl ConfigurationView {
     fn new(state: Entity<State>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let api_key_editor = cx.new(|cx| {
-            InputField::new(
-                window,
-                cx,
-                "Your Windsurf auth token (from windsurf.com/show-auth-token)",
-            )
-        });
+        let email_editor = cx.new(|cx| InputField::new(window, cx, "Email"));
+        let password_editor =
+            cx.new(|cx| InputField::new(window, cx, "Password").masked(true));
 
         cx.observe(&state, |_, _, cx| {
             cx.notify();
@@ -507,124 +694,317 @@ impl ConfigurationView {
         }));
 
         Self {
-            api_key_editor,
+            email_editor,
+            password_editor,
             state,
             load_credentials_task,
         }
     }
 
-    fn save_api_key(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
-        let api_key = self.api_key_editor.read(cx).text(cx).trim().to_string();
-        if api_key.is_empty() {
+    fn add_account(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        let email = self.email_editor.read(cx).text(cx).trim().to_string();
+        let password = self.password_editor.read(cx).text(cx).trim().to_string();
+        if email.is_empty() || password.is_empty() {
             return;
         }
-
-        self.api_key_editor
+        self.email_editor
             .update(cx, |input, cx| input.set_text("", window, cx));
-
-        let state = self.state.clone();
-        cx.spawn_in(window, async move |_, cx| {
-            state
-                .update(cx, |state, cx| state.set_api_key(Some(api_key), cx))
-                .await
-        })
-        .detach_and_log_err(cx);
+        self.password_editor
+            .update(cx, |input, cx| input.set_text("", window, cx));
+        self.state
+            .update(cx, |state, cx| state.add_email_account(email, password, cx))
+            .detach();
     }
 
-    fn reset_api_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.api_key_editor
-            .update(cx, |input, cx| input.set_text("", window, cx));
-
-        let state = self.state.clone();
-        cx.spawn_in(window, async move |_, cx| {
-            state
-                .update(cx, |state, cx| state.set_api_key(None, cx))
-                .await
-        })
-        .detach_and_log_err(cx);
+    fn delete_account(&mut self, account_id: String, _: &mut Window, cx: &mut Context<Self>) {
+        self.state
+            .update(cx, |state, cx| state.remove_account(account_id, cx))
+            .detach();
     }
 
-    fn should_render_editor(&self, cx: &mut Context<Self>) -> bool {
-        !self.state.read(cx).is_authenticated()
+    fn refresh_accounts(&mut self, _: &ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.state
+            .update(cx, |state, cx| state.refresh_accounts(cx))
+            .detach();
     }
 }
 
 impl Render for ConfigurationView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let auto_authenticated = self.state.read(cx).auto_authenticated;
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.load_credentials_task.is_some() {
+            return div()
+                .child(Label::new("Loading credentials…").color(Color::Muted))
+                .into_any();
+        }
+
         let env_var_set = self.state.read(cx).api_key_state.is_from_env_var();
-        let configured_card_label = if auto_authenticated {
-            "Auto-configured from local Windsurf installation".to_string()
-        } else if env_var_set {
-            format!("Auth token set in {AUTH_TOKEN_ENV_VAR_NAME} environment variable")
-        } else {
-            let api_url = WindsurfLanguageModelProvider::api_url(cx);
-            if api_url == DEFAULT_API_URL {
-                "Auth token configured".to_string()
-            } else {
-                format!("Auth token configured for {api_url}")
-            }
-        };
-
-        let setup_instructions = v_flex()
-            .gap_2()
-            .child(Label::new(
-                "Windsurf accounts were not detected automatically. Start the local proxy and paste your token below.",
-            ))
-            .child(
-                List::new()
-                    .child(
-                        ListBulletItem::new("")
-                            .child(Label::new("Get your token at"))
-                            .child(ButtonLink::new(
-                                "windsurf.com/show-auth-token",
-                                "https://windsurf.com/show-auth-token",
-                            )),
-                    )
-                    .child(ListBulletItem::new(
-                        "Paste it below and press Enter. Done.",
-                    )),
-            );
-
-        let api_key_section = if self.should_render_editor(cx) {
-            v_flex()
-                .on_action(cx.listener(Self::save_api_key))
-                .child(setup_instructions)
+        if env_var_set {
+            return v_flex()
+                .gap_2()
+                .child(Label::new(format!(
+                    "Auth token set via {AUTH_TOKEN_ENV_VAR_NAME} environment variable."
+                )))
                 .child(
-                    div()
-                        .pt(DynamicSpacing::Base04.rems(cx))
-                        .child(self.api_key_editor.clone()),
+                    Label::new("Unset the environment variable and restart Celadon to manage accounts here.")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .into_any();
+        }
+
+        let accounts = self.state.read(cx).proxy_accounts.clone();
+        let accounts_loading = self.state.read(cx).accounts_loading;
+        let add_error = self.state.read(cx).add_account_error.clone();
+
+        let selected_ids = self.state.read(cx).selected_account_ids.clone();
+        let selected_count = selected_ids.len();
+        let all_selected = !accounts.is_empty() && selected_count == accounts.len();
+
+        let current_id = accounts
+            .iter()
+            .filter(|a| a.last_used.is_some())
+            .max_by(|a, b| a.last_used.cmp(&b.last_used))
+            .map(|a| a.id.clone());
+
+        let account_rows = accounts.iter().map(|account| {
+            let account_id = account.id.clone();
+            let is_selected = selected_ids.contains(&account_id);
+            let tier_color = match account.tier.as_str() {
+                "pro" => Color::Success,
+                "free" => Color::Accent,
+                _ => Color::Muted,
+            };
+            let status_color = if account.status == "active" {
+                Color::Success
+            } else {
+                Color::Warning
+            };
+            let check_icon = if is_selected { "✓" } else { "○" };
+            let check_color = if is_selected { Color::Accent } else { Color::Muted };
+
+            let is_current = current_id.as_deref() == Some(account_id.as_str());
+
+            let daily_pct = account.daily_percent.unwrap_or(100);
+            let weekly_pct = account.weekly_percent.unwrap_or(100);
+            let credit_color = if daily_pct < 20 {
+                Color::Error
+            } else if daily_pct < 50 {
+                Color::Warning
+            } else {
+                Color::Success
+            };
+            let credit_label = SharedString::from(format!(
+                "{}%↓ {}%/wk",
+                daily_pct, weekly_pct
+            ));
+            let plan_label = account
+                .plan_name
+                .as_deref()
+                .unwrap_or("")
+                .to_string();
+
+            h_flex()
+                .w_full()
+                .justify_between()
+                .items_center()
+                .py_1()
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            Button::new(
+                                SharedString::from(format!("chk-{}", account_id)),
+                                check_icon,
+                            )
+                            .label_size(LabelSize::Small)
+                            .color(check_color)
+                            .on_click({
+                                let id = account_id.clone();
+                                cx.listener(move |this, _, _, cx| {
+                                    this.state.update(cx, |state, cx| {
+                                        state.toggle_selection(id.clone(), cx);
+                                    });
+                                })
+                            }),
+                        )
+                        .when(is_current, |this| {
+                            this.child(
+                                Label::new("★")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Accent),
+                            )
+                        })
+                        .child(Label::new(account.email.clone()))
+                        .child(
+                            Label::new(account.tier.clone())
+                                .size(LabelSize::Small)
+                                .color(tier_color),
+                        )
+                        .child(
+                            Label::new(account.status.clone())
+                                .size(LabelSize::Small)
+                                .color(status_color),
+                        )
+                        .child(
+                            Label::new(credit_label)
+                                .size(LabelSize::Small)
+                                .color(credit_color),
+                        )
+                        .when(!plan_label.is_empty(), |this| {
+                            this.child(
+                                Label::new(plan_label)
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            )
+                        }),
                 )
                 .child(
-                    Label::new(format!(
-                        "You can also set the {AUTH_TOKEN_ENV_VAR_NAME} environment variable and restart Zed."
-                    ))
+                    Button::new(
+                        SharedString::from(format!("del-{}", account_id)),
+                        "Remove",
+                    )
+                    .label_size(LabelSize::Small)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.delete_account(account_id.clone(), window, cx);
+                    })),
+                )
+        });
+
+        let bulk_bar = h_flex()
+            .w_full()
+            .gap_2()
+            .items_center()
+            .child(
+                Button::new("sel-all", if all_selected { "Deselect All" } else { "Select All" })
+                    .label_size(LabelSize::Small)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.state.update(cx, |state, cx| {
+                            if state.selected_account_ids.len() == state.proxy_accounts.len()
+                                && !state.proxy_accounts.is_empty()
+                            {
+                                state.deselect_all_accounts(cx);
+                            } else {
+                                state.select_all_accounts(cx);
+                            }
+                        });
+                    })),
+            )
+            .when(selected_count > 0, |this| {
+                this.child(
+                    Button::new(
+                        "del-selected",
+                        SharedString::from(format!("Delete Selected ({})", selected_count)),
+                    )
+                    .label_size(LabelSize::Small)
+                    .color(Color::Warning)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.state
+                            .update(cx, |state, cx| state.remove_selected_accounts(cx))
+                            .detach();
+                    })),
+                )
+            });
+
+        let accounts_section = v_flex()
+            .w_full()
+            .gap_1()
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        Label::new(if accounts.is_empty() {
+                            "No accounts — add one below."
+                        } else {
+                            "Accounts (round-robin load balanced):"
+                        })
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                    )
+                    .child(
+                        Button::new(
+                            "refresh-accounts",
+                            if accounts_loading { "Refreshing…" } else { "Refresh" },
+                        )
+                        .label_size(LabelSize::Small)
+                        .disabled(accounts_loading)
+                        .on_click(cx.listener(Self::refresh_accounts)),
+                    ),
+            )
+            .children(account_rows)
+            .when(!accounts.is_empty(), |this| this.child(bulk_bar));
+
+        let add_form = v_flex()
+            .w_full()
+            .gap_2()
+            .on_action(cx.listener(Self::add_account))
+            .child(
+                Label::new("Add Account (Email + Password):")
                     .size(LabelSize::Small)
                     .color(Color::Muted),
+            )
+            .child(self.email_editor.clone())
+            .child(self.password_editor.clone())
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("add-account-btn", "Add Account")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let email =
+                                    this.email_editor.read(cx).text(cx).trim().to_string();
+                                let password =
+                                    this.password_editor.read(cx).text(cx).trim().to_string();
+                                if email.is_empty() || password.is_empty() {
+                                    return;
+                                }
+                                this.email_editor
+                                    .update(cx, |input, cx| input.set_text("", window, cx));
+                                this.password_editor
+                                    .update(cx, |input, cx| input.set_text("", window, cx));
+                                this.state
+                                    .update(cx, |state, cx| {
+                                        state.add_email_account(email, password, cx)
+                                    })
+                                    .detach();
+                            })),
+                    )
+                    .child(
+                        Button::new("batch-paste-btn", "Paste & Add All")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let text = cx
+                                    .read_from_clipboard()
+                                    .and_then(|item| item.text().map(|t| t.to_string()))
+                                    .unwrap_or_default();
+                                let pairs = parse_batch_accounts(&text);
+                                for (email, password) in pairs {
+                                    this.state
+                                        .update(cx, |state, cx| {
+                                            state.add_email_account(email, password, cx)
+                                        })
+                                        .detach();
+                                }
+                            }))
+                            .tooltip(ui::Tooltip::text(
+                                "Copy lines like  email----password  then click here",
+                            )),
+                    ),
+            )
+            .when_some(add_error, |this, err| {
+                this.child(
+                    Label::new(err)
+                        .size(LabelSize::Small)
+                        .color(Color::Error),
                 )
-                .into_any_element()
-        } else {
-            ConfiguredApiCard::new(configured_card_label)
-                .disabled(auto_authenticated || env_var_set)
-                .when(auto_authenticated, |this| {
-                    this.tooltip_label("Windsurf accounts auto-loaded from your local installation. Re-open Zed to refresh.")
-                })
-                .when(!auto_authenticated && env_var_set, |this| {
-                    this.tooltip_label(format!(
-                        "To reset your auth token, unset the {AUTH_TOKEN_ENV_VAR_NAME} environment variable."
-                    ))
-                })
-                .when(!auto_authenticated && !env_var_set, |this| {
-                    this.on_click(cx.listener(|this, _, window, cx| this.reset_api_key(window, cx)))
-                })
-                .into_any_element()
-        };
+            });
 
-        if self.load_credentials_task.is_some() {
-            div().child(Label::new("Loading credentials…")).into_any()
-        } else {
-            v_flex().size_full().child(api_key_section).into_any()
-        }
+        v_flex()
+            .w_full()
+            .gap_3()
+            .child(accounts_section)
+            .child(add_form)
+            .into_any()
     }
 }
 
@@ -639,6 +1019,7 @@ async fn register_api_key_with_proxy(
     let uri = format!("{base_url}/auth/login");
     let escaped = api_key.replace('"', "\\\"");
     let body = format!("{{\"api_key\":\"{escaped}\"}}");
+
     let request = HttpRequest::builder()
         .method(Method::POST)
         .uri(uri)
@@ -761,3 +1142,139 @@ fn infer_output_tokens(model_id: &str) -> u64 {
     else { 16_384 }
 }
 
+fn parse_batch_accounts(text: &str) -> Vec<(String, String)> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            if let Some(pos) = line.find("----") {
+                let email = line[..pos].trim().to_string();
+                let password = line[pos + 4..].trim().to_string();
+                if !email.is_empty() && !password.is_empty() {
+                    return Some((email, password));
+                }
+            }
+            if let Some(pos) = line.rfind(':') {
+                let before = &line[..pos];
+                if before.contains('@') {
+                    let email = before.trim().to_string();
+                    let password = line[pos + 1..].trim().to_string();
+                    if !email.is_empty() && !password.is_empty() {
+                        return Some((email, password));
+                    }
+                }
+            }
+            None
+        })
+        .collect()
+}
+
+async fn fetch_proxy_accounts(
+    http_client: &dyn HttpClient,
+    proxy_api_url: &str,
+) -> Result<Vec<ProxyAccount>> {
+    use futures::AsyncReadExt;
+    let base_url = proxy_api_url
+        .trim_end_matches("/v1")
+        .trim_end_matches('/');
+    let uri = format!("{base_url}/auth/accounts");
+    let request = HttpRequest::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .body(AsyncBody::empty())?;
+    let mut response = http_client.send(request).await?;
+    if !response.status().is_success() {
+        anyhow::bail!("accounts fetch failed: {}", response.status());
+    }
+    let mut body = String::new();
+    response.body_mut().read_to_string(&mut body).await?;
+    let json: serde_json::Value = serde_json::from_str(&body)?;
+    let arr = json["accounts"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("no accounts field"))?;
+    let accounts = arr
+        .iter()
+        .filter_map(|a| {
+            let credits = &a["credits"];
+            let daily_percent = credits["dailyPercent"]
+                .as_u64()
+                .or_else(|| credits["percent"].as_u64())
+                .map(|v| v as u32);
+            let weekly_percent = credits["weeklyPercent"].as_u64().map(|v| v as u32);
+            let plan_name = credits["planName"].as_str().map(|s| s.to_string());
+            let last_used = a["lastUsed"].as_str().map(|s| {
+                s.get(..19).unwrap_or(s).replace('T', " ")
+            });
+            Some(ProxyAccount {
+                id: a["id"].as_str()?.to_string(),
+                email: a["email"].as_str()?.to_string(),
+                tier: a["tier"].as_str().unwrap_or("unknown").to_string(),
+                status: a["status"].as_str().unwrap_or("unknown").to_string(),
+                daily_percent,
+                weekly_percent,
+                plan_name,
+                last_used,
+            })
+        })
+        .collect();
+    Ok(accounts)
+}
+
+async fn add_email_account_to_proxy(
+    http_client: &dyn HttpClient,
+    proxy_api_url: &str,
+    email: &str,
+    password: &str,
+) -> Result<()> {
+    use futures::AsyncReadExt;
+    let base_url = proxy_api_url
+        .trim_end_matches("/v1")
+        .trim_end_matches('/');
+    let uri = format!("{base_url}/auth/login");
+    let email_escaped = email.replace('"', "\\\"");
+    let password_escaped = password.replace('"', "\\\"");
+    let body = format!(
+        "{{\"email\":\"{email_escaped}\",\"password\":\"{password_escaped}\"}}"
+    );
+    let request = HttpRequest::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header("Content-Type", "application/json")
+        .body(AsyncBody::from(body))?;
+    let mut response = http_client.send(request).await?;
+    if !response.status().is_success() {
+        let mut buf = String::new();
+        response.body_mut().read_to_string(&mut buf).await.ok();
+        let msg = serde_json::from_str::<serde_json::Value>(&buf)
+            .ok()
+            .and_then(|v| v["error"].as_str().map(|s| s.to_string()))
+            .unwrap_or(buf);
+        anyhow::bail!("Login failed: {}", msg);
+    }
+    Ok(())
+}
+
+async fn remove_proxy_account(
+    http_client: &dyn HttpClient,
+    proxy_api_url: &str,
+    account_id: &str,
+) -> Result<()> {
+    use futures::AsyncReadExt;
+    let base_url = proxy_api_url
+        .trim_end_matches("/v1")
+        .trim_end_matches('/');
+    let uri = format!("{base_url}/auth/accounts/{account_id}");
+    let request = HttpRequest::builder()
+        .method(Method::DELETE)
+        .uri(uri)
+        .body(AsyncBody::empty())?;
+    let mut response = http_client.send(request).await?;
+    if !response.status().is_success() {
+        let mut buf = String::new();
+        response.body_mut().read_to_string(&mut buf).await.ok();
+        anyhow::bail!("Remove account failed: {}", buf);
+    }
+    Ok(())
+}

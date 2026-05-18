@@ -31,18 +31,28 @@ Markdown（`.md`、`.markdown`）和 HTML（`.html`、`.htm`）文件的预览�
 
 打开方式：`Cmd+Shift+P` → **Preview: Open Preview**，或点击编辑器工具栏的 👁 图标。
 
-### 2. Windsurf AI 集成
+### 2. Windsurf AI 多账号管理
 
-内置 **Windsurf 语言模型 Provider**，连接本地 Windsurf 代理服务。Windsurf IDE 在运行时，Celadon 会自动从下面这个路径读取 session 完成认证：
+内置 **Windsurf 语言模型 Provider**，支持多账号批量添加、额度显示与自动换号，连接本地 Windsurf 代理服务（端口 `3003`）。
 
+#### 先决条件：启动本地代理
+
+Celadon 通过 [WindsurfAPI](https://github.com/AlexStrNik/windsurf-api) 代理与 Windsurf 通信。**首次使用需要先把代理跑起来：**
+
+```sh
+# 克隆并启动代理（需要 Node.js ≥ 18）
+git clone https://github.com/AlexStrNik/windsurf-api.git
+cd windsurf-api
+npm install
+npm start
+# 默认监听 localhost:3003
 ```
-~/Library/Application Support/Windsurf/User/globalStorage/
-  sparkcore.xinghuo-windsurf/devin-session-cache.json
-```
 
-无需手动配置 API Key。Windsurf 订阅中可用的全部模型（Claude、GPT、Gemini、DeepSeek 等）会自动出现在 Celadon 的 AI 面板中。
+> **注意**：代理依赖本机已安装的 Windsurf IDE 的 `language_server_macos_arm` 二进制。  
+> 路径示例：`/Applications/Windsurf.app/Contents/Resources/app/extensions/windsurf/bin/language_server_macos_arm`  
+> 只要装了 Windsurf，代理就能正常工作。
 
-配置（可选，全部有默认值）：
+#### 配置代理地址（可选，默认 `http://localhost:3003/v1`）
 
 ```json
 {
@@ -54,7 +64,74 @@ Markdown（`.md`、`.markdown`）和 HTML（`.html`、`.htm`）文件的预览�
 }
 ```
 
-也可设置环境变量 `WINDSURF_AUTH_TOKEN` 进行手动认证。
+---
+
+#### 多账号管理 UI
+
+打开 **Settings → AI → Windsurf**，面板提供：
+
+**账号列表**
+
+每行账号显示以下信息：
+- `★` — 当前 proxy 最近使用的账号（自动标记）
+- **邮箱** — 账号邮箱
+- **tier** — `pro` (绿色) / `free` (蓝色) / `expired` (灰色)
+- **status** — `active` (绿色) / 其他 (黄色)
+- **额度** — `67%↓ 84%/wk`（当日剩余 / 本周剩余，颜色：🟢≥50% · 🟡20-50% · 🔴<20%）
+- **套餐** — `Trial` / `Pro` 等
+
+**批量操作**
+
+| 按钮 | 功能 |
+|------|------|
+| `○` / `✓` | 勾选/取消勾选账号 |
+| Select All / Deselect All | 全选/全取消 |
+| Delete Selected (N) | 批量删除选中账号 |
+| Refresh | 立即刷新所有账号额度 |
+
+**添加账号**
+
+- **单个添加**：在 `Email` 和 `Password` 输入框填写后点击 `Add Account`
+- **批量粘贴**：将账号列表复制到剪贴板（每行一个，格式见下），点击 `Paste & Add All`
+
+批量粘贴格式（两种均支持）：
+```
+# 格式 1：----分隔
+email1@example.com----password1
+email2@example.com----password2
+
+# 格式 2：:分隔
+email1@example.com:password1
+email2@example.com:password2
+```
+
+**自动换号**
+
+- 代理本身具备 **round-robin 负载均衡**，当某个账号额度耗尽或出错时，代理自动切换到下一个可用账号
+- Celadon 每 **5 分钟**自动刷新一次账号额度显示，无需手动点击 Refresh
+
+---
+
+#### 方式二：环境变量（CI / 无 UI 场景）
+
+```sh
+export WINDSURF_AUTH_TOKEN="YOUR_TOKEN"
+```
+
+#### 已支持模型
+
+| 模型 | 备注 |
+|------|------|
+| claude-sonnet-4 | 推荐日常使用 |
+| claude-haiku-4.5 | 快速响应 |
+| claude-opus-4-7-high-thinking | ⚠️ 香港节点可能遇到 451 地理限制 |
+| gpt-5 | GPT 系列 |
+| gemini-2.5-pro / flash | 无地理限制，推荐替代 Claude |
+| kimi-k2 | 无地理限制 |
+| glm-4.7 | 无地理限制 |
+
+> **关于 451 Geo-restricted 错误**：Windsurf 香港机房被 Anthropic 地理封锁，所有账号均受影响。  
+> **解决方案**：切换到 `Gemini 2.5 Flash`、`Kimi K2` 或 `GLM-4.7` 等非 Anthropic 模型。
 
 ### 3. 中英双语界面
 
