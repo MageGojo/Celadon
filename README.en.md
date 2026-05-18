@@ -1,5 +1,10 @@
 # Celadon
 
+[![Release](https://img.shields.io/github/v/release/MageGojo/Celadon?color=7ea388)](https://github.com/MageGojo/Celadon/releases)
+[![License](https://img.shields.io/badge/license-GPL--3.0%20%2F%20Apache--2.0-7a5f52)](./LICENSE-GPL)
+[![Platform](https://img.shields.io/badge/platform-macOS-506956)](https://github.com/MageGojo/Celadon)
+[![Based on Zed](https://img.shields.io/badge/based%20on-Zed-7a6f89)](https://github.com/zed-industries/zed)
+
 > English · [中文](./README.md)
 
 **Celadon** is a personal fork of the [Zed editor](https://github.com/zed-industries/zed) that preserves all upstream Zed functionality while adding a refined visual theme and several locale-aware feature enhancements.
