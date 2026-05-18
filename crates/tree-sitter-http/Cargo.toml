@@ -1,0 +1,18 @@
+[package]
+name = "tree-sitter-http"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/tree_sitter_http.rs"
+
+[dependencies]
+tree-sitter-language = "0.1"
+
+[build-dependencies]
+cc = "1"

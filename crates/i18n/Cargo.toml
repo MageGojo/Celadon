@@ -1,0 +1,12 @@
+[package]
+name = "i18n"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/i18n.rs"

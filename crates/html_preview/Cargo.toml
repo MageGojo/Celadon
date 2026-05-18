@@ -1,0 +1,27 @@
+[package]
+name = "html_preview"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/html_preview.rs"
+
+[dependencies]
+file_icons.workspace = true
+gpui.workspace = true
+language.workspace = true
+multi_buffer.workspace = true
+ui.workspace = true
+workspace.workspace = true
+zed_actions.workspace = true
+pulldown-cmark = { workspace = true, features = ["html"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cocoa.workspace = true
+objc.workspace = true
+raw-window-handle = "0.6"
