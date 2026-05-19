@@ -201,6 +201,64 @@ pub fn has_visible_text(text: &str) -> bool {
     false
 }
 
+/// Strips Anthropic API XML artifacts injected by the Windsurf proxy
+/// (e.g. `<human>...</human>` tool-result wrappers, `<tool_call>` blocks,
+/// orphaned `</assistant>` tags) while preserving any actual visible text.
+pub fn strip_anthropic_xml(text: &str) -> String {
+    const BLOCK_TAGS: &[&str] = &[
+        "human",
+        "assistant",
+        "tool_call",
+        "tool_results",
+        "function_calls",
+        "invoke",
+        "parameters",
+        "parameter",
+    ];
+
+    let mut result = String::new();
+    let mut remaining = text;
+
+    while let Some(lt) = remaining.find('<') {
+        result.push_str(&remaining[..lt]);
+        remaining = &remaining[lt..];
+
+        let Some(gt) = remaining.find('>') else {
+            result.push_str(remaining);
+            return result;
+        };
+
+        let tag_inner = &remaining[1..gt];
+        let is_closing = tag_inner.starts_with('/');
+        let tag_body = if is_closing { &tag_inner[1..] } else { tag_inner };
+        let tag_name = tag_body
+            .split(|c: char| !c.is_alphanumeric() && c != '-' && c != '_')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+
+        remaining = &remaining[gt + 1..];
+
+        if BLOCK_TAGS.contains(&tag_name.as_str()) {
+            if !is_closing {
+                let close = format!("</{}>", tag_name);
+                if let Some(close_pos) = remaining.find(&close) {
+                    remaining = &remaining[close_pos + close.len()..];
+                } else {
+                    return result;
+                }
+            }
+        } else {
+            result.push('<');
+            result.push_str(tag_inner);
+            result.push('>');
+        }
+    }
+
+    result.push_str(remaining);
+    result
+}
+
 impl UserMessage {
     pub fn to_markdown(&self) -> String {
         let mut markdown = String::new();
@@ -1216,8 +1274,9 @@ impl Thread {
                     for content in &assistant_message.content {
                         match content {
                             AgentMessageContent::Text(text) => {
-                                if has_visible_text(text) {
-                                    stream.send_text(text);
+                                let cleaned = strip_anthropic_xml(text);
+                                if has_visible_text(&cleaned) {
+                                    stream.send_text(&cleaned);
                                 }
                             }
                             AgentMessageContent::Thinking { text, .. } => {
@@ -2885,6 +2944,11 @@ impl Thread {
             }
         }
 
+        for item in &mut message.content {
+            if let AgentMessageContent::Text(text) = item {
+                *text = strip_anthropic_xml(text);
+            }
+        }
         message.content.retain(|item| match item {
             AgentMessageContent::Text(text) => has_visible_text(text),
             _ => true,
