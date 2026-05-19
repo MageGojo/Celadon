@@ -184,6 +184,23 @@ pub enum UserMessageContent {
     Image(LanguageModelImage),
 }
 
+/// Returns `true` if `text` contains any visible characters outside of
+/// XML/HTML tags, i.e. the text is not just tag markup like `<human>` or
+/// `</human>`. Used to filter out corrupted empty human-turn XML wrappers
+/// that some legacy or external tools insert into the conversation.
+pub fn has_visible_text(text: &str) -> bool {
+    let mut in_tag = false;
+    for ch in text.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag && !ch.is_whitespace() => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 impl UserMessage {
     pub fn to_markdown(&self) -> String {
         let mut markdown = String::new();
@@ -1186,11 +1203,23 @@ impl Thread {
         let stream = ThreadEventStream(tx);
         for message in &self.messages {
             match message {
-                Message::User(user_message) => stream.send_user_message(user_message),
+                Message::User(user_message) => {
+                    let has_visible = user_message.content.iter().any(|c| match c {
+                        UserMessageContent::Text(text) => has_visible_text(text),
+                        UserMessageContent::Image(_) | UserMessageContent::Mention { .. } => true,
+                    });
+                    if has_visible {
+                        stream.send_user_message(user_message);
+                    }
+                }
                 Message::Agent(assistant_message) => {
                     for content in &assistant_message.content {
                         match content {
-                            AgentMessageContent::Text(text) => stream.send_text(text),
+                            AgentMessageContent::Text(text) => {
+                                if has_visible_text(text) {
+                                    stream.send_text(text);
+                                }
+                            }
                             AgentMessageContent::Thinking { text, .. } => {
                                 stream.send_thinking(text)
                             }
@@ -2854,6 +2883,15 @@ impl Thread {
                     },
                 );
             }
+        }
+
+        message.content.retain(|item| match item {
+            AgentMessageContent::Text(text) => has_visible_text(text),
+            _ => true,
+        });
+
+        if message.content.is_empty() {
+            return;
         }
 
         self.messages.push(Message::Agent(message));

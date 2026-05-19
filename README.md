@@ -80,6 +80,15 @@ npm start
 - **额度** — `67%↓ 84%/wk`（当日剩余 / 本周剩余，颜色：🟢≥50% · 🟡20-50% · 🔴<20%）
 - **套餐** — `Trial` / `Pro` 等
 
+**手动换号（Solo Mode）**
+
+点击账号行右侧的 **Use Only** 按钮，进入 Solo Mode：
+
+- 当前账号保留在代理池，其他账号被**暂停**（从代理池移除，但仍在 UI 中显示为灰色）
+- 面板顶部出现「Solo Mode」横幅
+- 点击 **Auto (Restore All)** 一键恢复所有暂停账号，重新进入轮询模式
+- 重新添加不会产生重复账号（自动跳过已在代理池中的邮箱）
+
 **批量操作**
 
 | 按钮 | 功能 |
@@ -87,6 +96,8 @@ npm start
 | `○` / `✓` | 勾选/取消勾选账号 |
 | Select All / Deselect All | 全选/全取消 |
 | Delete Selected (N) | 批量删除选中账号 |
+| Remove Invalid | 批量删除无可用模型（`0 models`）的账号 |
+| Auto (Restore All) | Solo Mode 下：恢复所有暂停账号并退出独占模式 |
 | Refresh | 立即刷新所有账号额度 |
 
 **添加账号**
@@ -109,6 +120,15 @@ email2@example.com:password2
 
 - 代理本身具备 **round-robin 负载均衡**，当某个账号额度耗尽或出错时，代理自动切换到下一个可用账号
 - Celadon 每 **5 分钟**自动刷新一次账号额度显示，无需手动点击 Refresh
+
+**修复：XML 标签泄漏到对话历史**
+
+Windsurf 代理使用 Anthropic API 内部 XML 格式（`<human>`、`</human>`、`</parameter>`、`</assistant>` 等），这些标签有时会以原始文本形式泄漏进对话，导致：
+
+- 历史消息中出现裸露的 `<human>` / `</human>` 标签
+- 模型看到这些标签后误以为是用户输入，产生错误的上下文理解
+
+**修复方案**：在消息回放（`replay()`）和消息持久化（`flush_pending_message()`）阶段，过滤所有仅含 XML 标签和空白字符的文本块，使其不渲染也不存入历史。
 
 ---
 

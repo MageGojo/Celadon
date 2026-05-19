@@ -1795,9 +1795,15 @@ impl NativeAgentConnection {
                             ThreadEvent::UserMessage(message) => {
                                 acp_thread.update(cx, |thread, cx| {
                                     for content in message.content {
+                                        let block: acp::ContentBlock = content.into();
+                                        if let acp::ContentBlock::Text(ref text_content) = block {
+                                            if !has_visible_text(&text_content.text) {
+                                                continue;
+                                            }
+                                        }
                                         thread.push_user_content_block(
                                             Some(message.id.clone()),
-                                            content.into(),
+                                            block,
                                             cx,
                                         );
                                     }

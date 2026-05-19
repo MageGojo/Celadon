@@ -14,7 +14,7 @@ use language_model::{
 use menu;
 use open_ai::{ResponseStreamEvent, stream_completion};
 use settings::{Settings, SettingsStore};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 use ui::prelude::*;
 use ui_input::InputField;
@@ -31,6 +31,13 @@ const DEFAULT_API_URL: &str = "http://localhost:3003/v1";
 const AUTH_TOKEN_ENV_VAR_NAME: &str = "WINDSURF_AUTH_TOKEN";
 static AUTH_TOKEN_ENV_VAR: LazyLock<EnvVar> = env_var!(AUTH_TOKEN_ENV_VAR_NAME);
 
+#[derive(Clone, Debug)]
+struct PausedAccount {
+    info: ProxyAccount,
+    email: Option<String>,
+    password: Option<String>,
+}
+
 #[derive(Clone, Debug, Default)]
 struct ProxyAccount {
     id: String,
@@ -41,6 +48,8 @@ struct ProxyAccount {
     weekly_percent: Option<u32>,
     plan_name: Option<String>,
     last_used: Option<String>,
+    ok_model_count: u32,
+    error_count: u32,
 }
 
 #[derive(Default, Clone, Debug, PartialEq)]
@@ -64,6 +73,9 @@ pub struct State {
     accounts_loading: bool,
     add_account_error: Option<String>,
     selected_account_ids: HashSet<String>,
+    exclusive_account_id: Option<String>,
+    paused_accounts: Vec<PausedAccount>,
+    known_credentials: HashMap<String, String>,
 }
 
 impl State {
@@ -208,6 +220,7 @@ impl State {
         let http_client = self.http_client.clone();
         let api_url = WindsurfLanguageModelProvider::api_url(cx);
         self.add_account_error = None;
+        self.known_credentials.insert(email.clone(), password.clone());
         cx.notify();
         cx.spawn(async move |this, cx| {
             match add_email_account_to_proxy(http_client.as_ref(), &api_url, &email, &password)
@@ -279,6 +292,110 @@ impl State {
         cx.notify();
     }
 
+    fn set_exclusive_account(&mut self, account_id: String, cx: &mut Context<Self>) -> Task<()> {
+        let http_client = self.http_client.clone();
+        let api_url = WindsurfLanguageModelProvider::api_url(cx);
+        let to_pause: Vec<PausedAccount> = self
+            .proxy_accounts
+            .iter()
+            .filter(|a| a.id != account_id)
+            .map(|a| {
+                let password = self.known_credentials.get(&a.email).cloned();
+                PausedAccount {
+                    info: a.clone(),
+                    email: Some(a.email.clone()),
+                    password,
+                }
+            })
+            .collect();
+        let ids_to_remove: Vec<String> = to_pause.iter().map(|p| p.info.id.clone()).collect();
+        self.paused_accounts.extend(to_pause);
+        self.exclusive_account_id = Some(account_id);
+        cx.spawn(async move |this, cx| {
+            for id in &ids_to_remove {
+                remove_proxy_account(http_client.as_ref(), &api_url, id)
+                    .await
+                    .log_err();
+            }
+            let accounts = fetch_proxy_accounts(http_client.as_ref(), &api_url)
+                .await
+                .unwrap_or_default();
+            this.update(cx, |this, cx| {
+                this.proxy_accounts = accounts;
+                cx.notify();
+            })
+            .log_err();
+        })
+    }
+
+    fn restore_all_accounts(&mut self, cx: &mut Context<Self>) -> Task<()> {
+        let http_client = self.http_client.clone();
+        let api_url = WindsurfLanguageModelProvider::api_url(cx);
+        let paused = std::mem::take(&mut self.paused_accounts);
+        let already_in_pool: HashSet<String> = self
+            .proxy_accounts
+            .iter()
+            .map(|a| a.email.clone())
+            .collect();
+        self.exclusive_account_id = None;
+        cx.spawn(async move |this, cx| {
+            for account in &paused {
+                if let (Some(email), Some(password)) = (&account.email, &account.password) {
+                    if already_in_pool.contains(email) {
+                        continue;
+                    }
+                    add_email_account_to_proxy(http_client.as_ref(), &api_url, email, password)
+                        .await
+                        .log_err();
+                }
+            }
+            let accounts = fetch_proxy_accounts(http_client.as_ref(), &api_url)
+                .await
+                .unwrap_or_default();
+            this.update(cx, |this, cx| {
+                this.proxy_accounts = accounts;
+                this.auto_authenticated = !this.proxy_accounts.is_empty();
+                cx.notify();
+            })
+            .log_err();
+        })
+    }
+
+    fn clear_exclusive_account(&mut self, cx: &mut Context<Self>) {
+        self.exclusive_account_id = None;
+        self.paused_accounts.clear();
+        cx.notify();
+    }
+
+    fn remove_broken_accounts(&mut self, cx: &mut Context<Self>) -> Task<()> {
+        let http_client = self.http_client.clone();
+        let api_url = WindsurfLanguageModelProvider::api_url(cx);
+        let broken_ids: Vec<String> = self
+            .proxy_accounts
+            .iter()
+            .filter(|a| a.ok_model_count == 0)
+            .map(|a| a.id.clone())
+            .collect();
+        cx.spawn(async move |this, cx| {
+            for id in &broken_ids {
+                remove_proxy_account(http_client.as_ref(), &api_url, id)
+                    .await
+                    .log_err();
+            }
+            let accounts = fetch_proxy_accounts(http_client.as_ref(), &api_url)
+                .await
+                .unwrap_or_default();
+            this.update(cx, |this, cx| {
+                this.proxy_accounts = accounts;
+                if this.proxy_accounts.is_empty() {
+                    this.auto_authenticated = false;
+                }
+                cx.notify();
+            })
+            .log_err();
+        })
+    }
+
     fn remove_selected_accounts(&mut self, cx: &mut Context<Self>) -> Task<()> {
         let ids: Vec<String> = self.selected_account_ids.iter().cloned().collect();
         let http_client = self.http_client.clone();
@@ -334,6 +451,9 @@ impl WindsurfLanguageModelProvider {
                 accounts_loading: false,
                 add_account_error: None,
                 selected_account_ids: HashSet::new(),
+                exclusive_account_id: None,
+                paused_accounts: Vec::new(),
+                known_credentials: HashMap::new(),
             }
         });
 
@@ -759,12 +879,61 @@ impl Render for ConfigurationView {
         let selected_ids = self.state.read(cx).selected_account_ids.clone();
         let selected_count = selected_ids.len();
         let all_selected = !accounts.is_empty() && selected_count == accounts.len();
+        let exclusive_id = self.state.read(cx).exclusive_account_id.clone();
+        let paused = self.state.read(cx).paused_accounts.clone();
+        let has_broken = accounts.iter().any(|a| a.ok_model_count == 0);
+        let restorable_count = paused.iter().filter(|p| p.password.is_some()).count();
+        let paused_count = paused.len();
 
         let current_id = accounts
             .iter()
             .filter(|a| a.last_used.is_some())
             .max_by(|a, b| a.last_used.cmp(&b.last_used))
             .map(|a| a.id.clone());
+
+        let paused_rows = paused.iter().map(|paused_acct| {
+            let can_restore = paused_acct.password.is_some();
+            let email = paused_acct.info.email.clone();
+            let caps_label = if paused_acct.info.ok_model_count == 0 {
+                SharedString::from("no models")
+            } else {
+                SharedString::from(format!("{} models", paused_acct.info.ok_model_count))
+            };
+            h_flex()
+                .w_full()
+                .justify_between()
+                .items_center()
+                .py_1()
+                .opacity(0.4)
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            Label::new("⏸")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(Label::new(email).color(Color::Muted))
+                        .child(
+                            Label::new(caps_label)
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .when(!can_restore, |this| {
+                            this.child(
+                                Label::new("⚠ no creds")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Warning),
+                            )
+                        }),
+                )
+                .child(
+                    Label::new("paused")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+        });
 
         let account_rows = accounts.iter().map(|account| {
             let account_id = account.id.clone();
@@ -802,6 +971,13 @@ impl Render for ConfigurationView {
                 .as_deref()
                 .unwrap_or("")
                 .to_string();
+            let is_broken = account.ok_model_count == 0;
+            let caps_label = if is_broken {
+                SharedString::from("no models")
+            } else {
+                SharedString::from(format!("{} models", account.ok_model_count))
+            };
+            let caps_color = if is_broken { Color::Error } else { Color::Muted };
 
             h_flex()
                 .w_full()
@@ -857,17 +1033,55 @@ impl Render for ConfigurationView {
                                     .size(LabelSize::Small)
                                     .color(Color::Muted),
                             )
-                        }),
+                        })
+                        .child(
+                            Label::new(caps_label)
+                                .size(LabelSize::Small)
+                                .color(caps_color),
+                        ),
                 )
                 .child(
-                    Button::new(
-                        SharedString::from(format!("del-{}", account_id)),
-                        "Remove",
-                    )
-                    .label_size(LabelSize::Small)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.delete_account(account_id.clone(), window, cx);
-                    })),
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            Button::new(
+                                SharedString::from(format!("use-only-{}", account_id)),
+                                if exclusive_id.as_deref() == Some(account_id.as_str()) {
+                                    "◉ Sole"
+                                } else {
+                                    "Use Only"
+                                },
+                            )
+                            .label_size(LabelSize::Small)
+                            .color(if exclusive_id.as_deref() == Some(account_id.as_str()) {
+                                Color::Accent
+                            } else {
+                                Color::Muted
+                            })
+                            .tooltip(ui::Tooltip::text(
+                                "Remove all other accounts so only this one is used",
+                            ))
+                            .on_click({
+                                let id = account_id.clone();
+                                cx.listener(move |this, _, _, cx| {
+                                    this.state
+                                        .update(cx, |state, cx| {
+                                            state.set_exclusive_account(id.clone(), cx)
+                                        })
+                                        .detach();
+                                })
+                            }),
+                        )
+                        .child(
+                            Button::new(
+                                SharedString::from(format!("del-{}", account_id)),
+                                "Remove",
+                            )
+                            .label_size(LabelSize::Small)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.delete_account(account_id.clone(), window, cx);
+                            })),
+                        ),
                 )
         });
 
@@ -875,22 +1089,44 @@ impl Render for ConfigurationView {
             .w_full()
             .gap_2()
             .items_center()
-            .child(
-                Button::new("sel-all", if all_selected { "Deselect All" } else { "Select All" })
-                    .label_size(LabelSize::Small)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.state.update(cx, |state, cx| {
-                            if state.selected_account_ids.len() == state.proxy_accounts.len()
-                                && !state.proxy_accounts.is_empty()
-                            {
-                                state.deselect_all_accounts(cx);
-                            } else {
-                                state.select_all_accounts(cx);
-                            }
-                        });
-                    })),
-            )
-            .when(selected_count > 0, |this| {
+            .when(exclusive_id.is_some(), |this| {
+                let label = if restorable_count > 0 {
+                    SharedString::from(format!("⟳ Auto ({} restorable)", restorable_count))
+                } else {
+                    SharedString::from("⟳ Auto (re-add manually)")
+                };
+                this.child(
+                    Button::new("restore-all", label)
+                        .label_size(LabelSize::Small)
+                        .color(Color::Accent)
+                        .tooltip(ui::Tooltip::text(
+                            "Restore all paused accounts to rotation",
+                        ))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.state
+                                .update(cx, |state, cx| state.restore_all_accounts(cx))
+                                .detach();
+                        }))
+                )
+            })
+            .when(!exclusive_id.is_some(), |this| {
+                this.child(
+                    Button::new("sel-all", if all_selected { "Deselect All" } else { "Select All" })
+                        .label_size(LabelSize::Small)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.state.update(cx, |state, cx| {
+                                if state.selected_account_ids.len() == state.proxy_accounts.len()
+                                    && !state.proxy_accounts.is_empty()
+                                {
+                                    state.deselect_all_accounts(cx);
+                                } else {
+                                    state.select_all_accounts(cx);
+                                }
+                            });
+                        }))
+                )
+            })
+            .when(selected_count > 0 && exclusive_id.is_none(), |this| {
                 this.child(
                     Button::new(
                         "del-selected",
@@ -904,6 +1140,19 @@ impl Render for ConfigurationView {
                             .detach();
                     })),
                 )
+            })
+            .when(has_broken && exclusive_id.is_none(), |this| {
+                this.child(
+                    Button::new("rm-broken", "Remove Invalid")
+                        .label_size(LabelSize::Small)
+                        .color(Color::Error)
+                        .tooltip(ui::Tooltip::text("Remove all accounts with no working models"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.state
+                                .update(cx, |state, cx| state.remove_broken_accounts(cx))
+                                .detach();
+                        }))
+                )
             });
 
         let accounts_section = v_flex()
@@ -914,13 +1163,19 @@ impl Render for ConfigurationView {
                     .justify_between()
                     .items_center()
                     .child(
-                        Label::new(if accounts.is_empty() {
+                        Label::new(if accounts.is_empty() && paused_count == 0 {
                             "No accounts — add one below."
+                        } else if exclusive_id.is_some() {
+                            "Solo Mode — one active, others paused:"
                         } else {
                             "Accounts (round-robin load balanced):"
                         })
                         .size(LabelSize::Small)
-                        .color(Color::Muted),
+                        .color(if exclusive_id.is_some() {
+                            Color::Accent
+                        } else {
+                            Color::Muted
+                        }),
                     )
                     .child(
                         Button::new(
@@ -933,7 +1188,8 @@ impl Render for ConfigurationView {
                     ),
             )
             .children(account_rows)
-            .when(!accounts.is_empty(), |this| this.child(bulk_bar));
+            .children(paused_rows)
+            .when(!accounts.is_empty() || paused_count > 0, |this| this.child(bulk_bar));
 
         let add_form = v_flex()
             .w_full()
@@ -1207,6 +1463,11 @@ async fn fetch_proxy_accounts(
             let last_used = a["lastUsed"].as_str().map(|s| {
                 s.get(..19).unwrap_or(s).replace('T', " ")
             });
+            let ok_model_count = a["capabilities"]
+                .as_object()
+                .map(|caps| caps.values().filter(|v| v["ok"].as_bool() == Some(true)).count() as u32)
+                .unwrap_or(0);
+            let error_count = a["errorCount"].as_u64().unwrap_or(0) as u32;
             Some(ProxyAccount {
                 id: a["id"].as_str()?.to_string(),
                 email: a["email"].as_str()?.to_string(),
@@ -1216,6 +1477,8 @@ async fn fetch_proxy_accounts(
                 weekly_percent,
                 plan_name,
                 last_used,
+                ok_model_count,
+                error_count,
             })
         })
         .collect();

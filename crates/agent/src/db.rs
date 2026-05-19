@@ -178,14 +178,18 @@ impl DbThread {
                     for segment in msg.segments {
                         match segment {
                             crate::legacy_thread::SerializedMessageSegment::Text { text } => {
-                                content.push(UserMessageContent::Text(text));
+                                if !text.trim().is_empty() {
+                                    content.push(UserMessageContent::Text(text));
+                                }
                             }
                             crate::legacy_thread::SerializedMessageSegment::Thinking {
                                 text,
                                 ..
                             } => {
                                 // User messages don't have thinking segments, but handle gracefully
-                                content.push(UserMessageContent::Text(text));
+                                if !text.trim().is_empty() {
+                                    content.push(UserMessageContent::Text(text));
+                                }
                             }
                             crate::legacy_thread::SerializedMessageSegment::RedactedThinking {
                                 ..
@@ -196,7 +200,7 @@ impl DbThread {
                     }
 
                     // If no content was added, add context as text if available
-                    if content.is_empty() && !msg.context.is_empty() {
+                    if content.is_empty() && !msg.context.trim().is_empty() {
                         content.push(UserMessageContent::Text(msg.context));
                     }
 
